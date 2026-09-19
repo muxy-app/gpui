@@ -1,3 +1,8 @@
+> **Muxy fork.** This repository holds the published `gpui` crate source with
+> patches Muxy needs. `main` is the crates.io release plus Muxy commits on top;
+> upgrading means importing the next release and rebasing those commits.
+> Upstream: https://github.com/zed-industries/zed (crates/gpui).
+
 # Welcome to GPUI!
 
 GPUI is a hybrid immediate and retained mode, GPU accelerated, UI framework
