@@ -59,10 +59,11 @@ impl PlatformAtlas for MetalAtlas {
 
     fn remove(&self, key: &AtlasKey) {
         let mut lock = self.0.lock();
-        let Some(id) = lock.tiles_by_key.get(key).map(|v| v.texture_id) else {
+        let Some(tile) = lock.tiles_by_key.remove(key) else {
             return;
         };
 
+        let id = tile.texture_id;
         let textures = match id.kind {
             AtlasTextureKind::Monochrome => &mut lock.monochrome_textures,
             AtlasTextureKind::Polychrome => &mut lock.polychrome_textures,
@@ -81,7 +82,6 @@ impl PlatformAtlas for MetalAtlas {
 
             if texture.is_unreferenced() {
                 textures.free_list.push(id.index as usize);
-                lock.tiles_by_key.remove(key);
             } else {
                 *texture_slot = Some(texture);
             }
@@ -128,7 +128,13 @@ impl MetalAtlasState {
             width: DevicePixels(16384),
             height: DevicePixels(16384),
         };
-        let size = min_size.min(&MAX_ATLAS_SIZE).max(&DEFAULT_ATLAS_SIZE);
+        let dedicated = min_size.width > DEFAULT_ATLAS_SIZE.width
+            || min_size.height > DEFAULT_ATLAS_SIZE.height;
+        let size = if dedicated {
+            min_size.min(&MAX_ATLAS_SIZE)
+        } else {
+            DEFAULT_ATLAS_SIZE
+        };
         let texture_descriptor = metal::TextureDescriptor::new();
         texture_descriptor.set_width(size.width.into());
         texture_descriptor.set_height(size.height.into());
@@ -163,6 +169,7 @@ impl MetalAtlasState {
             allocator: etagere::BucketedAtlasAllocator::new(size.into()),
             metal_texture: AssertSend(metal_texture),
             live_atlas_keys: 0,
+            dedicated,
         };
 
         if let Some(ix) = index {
@@ -191,10 +198,14 @@ struct MetalAtlasTexture {
     allocator: BucketedAtlasAllocator,
     metal_texture: AssertSend<metal::Texture>,
     live_atlas_keys: u32,
+    dedicated: bool,
 }
 
 impl MetalAtlasTexture {
     fn allocate(&mut self, size: Size<DevicePixels>) -> Option<AtlasTile> {
+        if self.dedicated && self.live_atlas_keys != 0 {
+            return None;
+        }
         let allocation = self.allocator.allocate(size.into())?;
         let tile = AtlasTile {
             texture_id: self.id,
@@ -279,3 +290,76 @@ impl From<etagere::Rectangle> for Bounds<DevicePixels> {
 struct AssertSend<T>(T);
 
 unsafe impl<T> Send for AssertSend<T> {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ImageId, RenderImageParams, size};
+
+    fn key(id: usize) -> AtlasKey {
+        AtlasKey::Image(RenderImageParams {
+            image_id: ImageId(id),
+            frame_index: 0,
+        })
+    }
+
+    fn insert(atlas: &MetalAtlas, id: usize, width: i32, height: i32) -> AtlasTile {
+        atlas
+            .get_or_insert_with(&key(id), &mut || {
+                Ok(Some((
+                    size(DevicePixels(width), DevicePixels(height)),
+                    Cow::Owned(vec![0; (width * height * 4) as usize]),
+                )))
+            })
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn removing_a_shared_tile_is_immediate_and_idempotent() {
+        let atlas = MetalAtlas::new(Device::system_default().unwrap());
+        let first = insert(&atlas, 0, 16, 16);
+        let second = insert(&atlas, 1, 16, 16);
+        assert_eq!(first.texture_id, second.texture_id);
+
+        atlas.remove(&key(0));
+        atlas.remove(&key(0));
+        {
+            let state = atlas.0.lock();
+            assert!(!state.tiles_by_key.contains_key(&key(0)));
+            assert_eq!(state.texture(second.texture_id).live_atlas_keys, 1);
+        }
+        assert_eq!(insert(&atlas, 1, 16, 16), second);
+        atlas.remove(&key(1));
+        let state = atlas.0.lock();
+        assert!(state.tiles_by_key.is_empty());
+        assert!(state.polychrome_textures.textures[0].is_none());
+    }
+
+    #[test]
+    fn oversized_images_cannot_be_pinned_by_small_cached_images() {
+        let atlas = MetalAtlas::new(Device::system_default().unwrap());
+        let snapshot = insert(&atlas, 0, 720, 1658);
+        let icon = insert(&atlas, 1, 34, 32);
+        assert_ne!(snapshot.texture_id, icon.texture_id);
+        {
+            let state = atlas.0.lock();
+            let texture = state.texture(snapshot.texture_id);
+            assert_eq!(texture.metal_texture.width(), 720);
+            assert_eq!(texture.metal_texture.height(), 1658);
+        }
+        atlas.remove(&key(0));
+        for id in 2..52 {
+            let snapshot = insert(&atlas, id, 720 + id as i32, 1658);
+            assert_ne!(snapshot.texture_id, icon.texture_id);
+            atlas.remove(&key(id));
+            let state = atlas.0.lock();
+            assert_eq!(state.tiles_by_key.len(), 1);
+            assert_eq!(state.polychrome_textures.textures.len(), 2);
+            assert!(
+                state.polychrome_textures.textures[snapshot.texture_id.index as usize].is_none()
+            );
+        }
+        assert_eq!(insert(&atlas, 1, 34, 32), icon);
+    }
+}
