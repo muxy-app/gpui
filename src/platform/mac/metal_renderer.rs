@@ -37,18 +37,21 @@ const SHADERS_SOURCE_FILE: &str = include_str!(concat!(env!("OUT_DIR"), "/stitch
 // Use 4x MSAA, all devices support it.
 // https://developer.apple.com/documentation/metal/mtldevice/1433355-supportstexturesamplecount
 const PATH_SAMPLE_COUNT: u32 = 4;
+const MIN_INSTANCE_BUFFER_SIZE: usize = 2 * 1024 * 1024;
+const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
 
-pub type Context = Arc<Mutex<InstanceBufferPool>>;
+#[derive(Clone, Debug, Default)]
+pub struct Context;
 pub type Renderer = MetalRenderer;
 
 pub unsafe fn new_renderer(
-    context: self::Context,
+    _context: self::Context,
     _native_window: *mut c_void,
     _native_view: *mut c_void,
     _bounds: crate::Size<f32>,
     _transparent: bool,
 ) -> Renderer {
-    MetalRenderer::new(context)
+    MetalRenderer::new()
 }
 
 pub(crate) struct InstanceBufferPool {
@@ -59,7 +62,7 @@ pub(crate) struct InstanceBufferPool {
 impl Default for InstanceBufferPool {
     fn default() -> Self {
         Self {
-            buffer_size: 2 * 1024 * 1024,
+            buffer_size: MIN_INSTANCE_BUFFER_SIZE,
             buffers: Vec::new(),
         }
     }
@@ -76,7 +79,11 @@ impl InstanceBufferPool {
         self.buffers.clear();
     }
 
-    pub(crate) fn acquire(&mut self, device: &metal::Device) -> InstanceBuffer {
+    pub(crate) fn acquire(&mut self, device: &metal::Device, required: usize) -> InstanceBuffer {
+        let buffer_size = required.max(MIN_INSTANCE_BUFFER_SIZE).next_power_of_two();
+        if self.buffer_size != buffer_size {
+            self.reset(buffer_size);
+        }
         let buffer = self.buffers.pop().unwrap_or_else(|| {
             device.new_buffer(
                 self.buffer_size as u64,
@@ -129,7 +136,7 @@ pub struct PathRasterizationVertex {
 }
 
 impl MetalRenderer {
-    pub fn new(instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>) -> Self {
+    fn new() -> Self {
         // Prefer low‐power integrated GPUs on Intel Mac. On Apple
         // Silicon, there is only ever one GPU, so this is equivalent to
         // `metal::Device::system_default()`.
@@ -273,7 +280,7 @@ impl MetalRenderer {
             polychrome_sprites_pipeline_state,
             surfaces_pipeline_state,
             unit_vertices,
-            instance_buffer_pool,
+            instance_buffer_pool: Arc::new(Mutex::new(InstanceBufferPool::default())),
             sprite_atlas,
             core_video_texture_cache,
             is_apple_gpu,
@@ -363,6 +370,12 @@ impl MetalRenderer {
     }
 
     pub fn draw(&mut self, scene: &Scene) {
+        let Some(required) =
+            instance_buffer_bytes(scene).filter(|required| *required <= MAX_INSTANCE_BUFFER_SIZE)
+        else {
+            log::error!("scene exceeds the instance buffer size limit");
+            return;
+        };
         let layer = self.layer.clone();
         let viewport_size = layer.drawable_size();
         let viewport_size: Size<DevicePixels> = size(
@@ -379,52 +392,32 @@ impl MetalRenderer {
             return;
         };
 
-        loop {
-            let mut instance_buffer = self.instance_buffer_pool.lock().acquire(&self.device);
-
-            let command_buffer =
-                self.draw_primitives(scene, &mut instance_buffer, drawable, viewport_size);
-
-            match command_buffer {
-                Ok(command_buffer) => {
-                    let instance_buffer_pool = self.instance_buffer_pool.clone();
-                    let instance_buffer = Cell::new(Some(instance_buffer));
-                    let block = ConcreteBlock::new(move |_| {
-                        if let Some(instance_buffer) = instance_buffer.take() {
-                            instance_buffer_pool.lock().release(instance_buffer);
-                        }
-                    });
-                    let block = block.copy();
-                    command_buffer.add_completed_handler(&block);
-
-                    if self.presents_with_transaction {
-                        command_buffer.commit();
-                        command_buffer.wait_until_scheduled();
-                        drawable.present();
-                    } else {
-                        command_buffer.present_drawable(drawable);
-                        command_buffer.commit();
+        let mut instance_buffer = self
+            .instance_buffer_pool
+            .lock()
+            .acquire(&self.device, required);
+        match self.draw_primitives(scene, &mut instance_buffer, drawable, viewport_size) {
+            Ok(command_buffer) => {
+                let instance_buffer_pool = self.instance_buffer_pool.clone();
+                let instance_buffer = Cell::new(Some(instance_buffer));
+                let block = ConcreteBlock::new(move |_| {
+                    if let Some(instance_buffer) = instance_buffer.take() {
+                        instance_buffer_pool.lock().release(instance_buffer);
                     }
-                    return;
-                }
-                Err(err) => {
-                    log::error!(
-                        "failed to render: {}. retrying with larger instance buffer size",
-                        err
-                    );
-                    let mut instance_buffer_pool = self.instance_buffer_pool.lock();
-                    let buffer_size = instance_buffer_pool.buffer_size;
-                    if buffer_size >= 256 * 1024 * 1024 {
-                        log::error!("instance buffer size grew too large: {}", buffer_size);
-                        break;
-                    }
-                    instance_buffer_pool.reset(buffer_size * 2);
-                    log::info!(
-                        "increased instance buffer size to {}",
-                        instance_buffer_pool.buffer_size
-                    );
+                });
+                let block = block.copy();
+                command_buffer.add_completed_handler(&block);
+
+                if self.presents_with_transaction {
+                    command_buffer.commit();
+                    command_buffer.wait_until_scheduled();
+                    drawable.present();
+                } else {
+                    command_buffer.present_drawable(drawable);
+                    command_buffer.commit();
                 }
             }
+            Err(err) => log::error!("failed to render: {err}"),
         }
     }
 
@@ -556,6 +549,7 @@ impl MetalRenderer {
             location: 0,
             length: instance_offset as NSUInteger,
         });
+        debug_assert_eq!(Some(instance_offset), instance_buffer_bytes(scene));
         Ok(command_buffer.to_owned())
     }
 
@@ -595,16 +589,8 @@ impl MetalRenderer {
         command_encoder.set_render_pipeline_state(&self.paths_rasterization_pipeline_state);
 
         align_offset(instance_offset);
-        let mut vertices = Vec::new();
-        for path in paths {
-            vertices.extend(path.vertices.iter().map(|v| PathRasterizationVertex {
-                xy_position: v.xy_position,
-                st_position: v.st_position,
-                color: path.color,
-                bounds: path.bounds.intersect(&path.content_mask.bounds),
-            }));
-        }
-        let vertices_bytes_len = mem::size_of_val(vertices.as_slice());
+        let vertex_count = paths.iter().map(|path| path.vertices.len()).sum::<usize>();
+        let vertices_bytes_len = vertex_count * mem::size_of::<PathRasterizationVertex>();
         let next_offset = *instance_offset + vertices_bytes_len;
         if next_offset > instance_buffer.size {
             command_encoder.end_encoding();
@@ -625,20 +611,16 @@ impl MetalRenderer {
             Some(&instance_buffer.metal_buffer),
             *instance_offset as u64,
         );
-        let buffer_contents =
-            unsafe { (instance_buffer.metal_buffer.contents() as *mut u8).add(*instance_offset) };
         unsafe {
-            ptr::copy_nonoverlapping(
-                vertices.as_ptr() as *const u8,
-                buffer_contents,
-                vertices_bytes_len,
+            let output = std::slice::from_raw_parts_mut(
+                (instance_buffer.metal_buffer.contents() as *mut u8)
+                    .add(*instance_offset)
+                    .cast::<mem::MaybeUninit<PathRasterizationVertex>>(),
+                vertex_count,
             );
+            write_path_vertices(paths, output);
         }
-        command_encoder.draw_primitives(
-            metal::MTLPrimitiveType::Triangle,
-            0,
-            vertices.len() as u64,
-        );
+        command_encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, vertex_count as u64);
         *instance_offset = next_offset;
 
         command_encoder.end_encoding();
@@ -1302,6 +1284,79 @@ fn build_path_rasterization_pipeline_state(
         .expect("could not create render pipeline state")
 }
 
+fn instance_buffer_bytes(scene: &Scene) -> Option<usize> {
+    let mut offset = 0;
+    for batch in scene.batches() {
+        match batch {
+            PrimitiveBatch::Shadows(values) => {
+                reserve_instances::<Shadow>(&mut offset, values.len())?
+            }
+            PrimitiveBatch::Quads(values) => reserve_instances::<Quad>(&mut offset, values.len())?,
+            PrimitiveBatch::Underlines(values) => {
+                reserve_instances::<Underline>(&mut offset, values.len())?
+            }
+            PrimitiveBatch::MonochromeSprites { sprites, .. } => {
+                reserve_instances::<MonochromeSprite>(&mut offset, sprites.len())?;
+            }
+            PrimitiveBatch::PolychromeSprites { sprites, .. } => {
+                reserve_instances::<PolychromeSprite>(&mut offset, sprites.len())?;
+            }
+            PrimitiveBatch::Paths(paths) => {
+                let count = paths
+                    .iter()
+                    .try_fold(0usize, |count, path| count.checked_add(path.vertices.len()))?;
+                reserve_instances::<PathRasterizationVertex>(&mut offset, count)?;
+                if let Some(first) = paths.first() {
+                    let count = if paths.last()?.order == first.order {
+                        paths.len()
+                    } else {
+                        1
+                    };
+                    reserve_instances::<PathSprite>(&mut offset, count)?;
+                }
+            }
+            PrimitiveBatch::Surfaces(surfaces) => {
+                for _ in surfaces {
+                    reserve_instances::<Surface>(&mut offset, 1)?;
+                }
+            }
+        }
+    }
+    Some(offset)
+}
+
+fn reserve_instances<T>(offset: &mut usize, count: usize) -> Option<()> {
+    if count != 0 {
+        *offset = offset.checked_add(255)? & !255;
+        *offset = offset.checked_add(count.checked_mul(mem::size_of::<T>())?)?;
+    }
+    Some(())
+}
+
+fn write_path_vertices(
+    paths: &[Path<ScaledPixels>],
+    output: &mut [mem::MaybeUninit<PathRasterizationVertex>],
+) {
+    assert_eq!(
+        output.len(),
+        paths.iter().map(|path| path.vertices.len()).sum::<usize>()
+    );
+    let vertices = paths.iter().flat_map(|path| {
+        let bounds = path.bounds.intersect(&path.content_mask.bounds);
+        path.vertices
+            .iter()
+            .map(move |vertex| PathRasterizationVertex {
+                xy_position: vertex.xy_position,
+                st_position: vertex.st_position,
+                color: path.color,
+                bounds,
+            })
+    });
+    for (output, vertex) in output.iter_mut().zip(vertices) {
+        output.write(vertex);
+    }
+}
+
 // Align to multiples of 256 make Metal happy.
 fn align_offset(offset: &mut usize) {
     *offset = (*offset).div_ceil(256) * 256;
@@ -1364,4 +1419,100 @@ pub struct PathSprite {
 pub struct SurfaceBounds {
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{PathVertex, px};
+
+    #[test]
+    fn lighter_frames_retire_large_buffers_after_gpu_completion() {
+        let Some(device) = metal::Device::system_default() else {
+            return;
+        };
+        let mut pool = InstanceBufferPool::default();
+        let large = pool.acquire(&device, 24 * 1024 * 1024);
+        assert_eq!(large.size, 32 * 1024 * 1024);
+        let small = pool.acquire(&device, 1024);
+        assert_eq!(small.size, MIN_INSTANCE_BUFFER_SIZE);
+        pool.release(large);
+        assert!(pool.buffers.is_empty());
+        pool.release(small);
+        assert_eq!(pool.buffers.len(), 1);
+        assert_eq!(pool.buffers[0].length() as usize, MIN_INSTANCE_BUFFER_SIZE);
+    }
+
+    #[test]
+    fn separate_windows_keep_independent_frame_requirements() {
+        let Some(device) = metal::Device::system_default() else {
+            return;
+        };
+        let mut terminal = InstanceBufferPool::default();
+        let mut settings = InstanceBufferPool::default();
+        let large = terminal.acquire(&device, 24 * 1024 * 1024);
+        terminal.release(large);
+        let small = settings.acquire(&device, 1024);
+        settings.release(small);
+        assert_eq!(terminal.buffers[0].length() as usize, 32 * 1024 * 1024);
+        assert_eq!(
+            settings.buffers[0].length() as usize,
+            MIN_INSTANCE_BUFFER_SIZE
+        );
+        let lighter = terminal.acquire(&device, 1024);
+        assert_eq!(lighter.size, MIN_INSTANCE_BUFFER_SIZE);
+        assert!(terminal.buffers.is_empty());
+        assert_eq!(settings.buffers.len(), 1);
+    }
+
+    #[test]
+    fn path_vertices_preserve_positions_colors_and_clipping_without_staging() {
+        let mut path = Path::new(point(px(0.), px(0.))).scale(1.);
+        path.bounds = Bounds::new(
+            point(ScaledPixels(0.), ScaledPixels(0.)),
+            size(ScaledPixels(20.), ScaledPixels(20.)),
+        );
+        path.content_mask.bounds = Bounds::new(
+            point(ScaledPixels(5.), ScaledPixels(4.)),
+            size(ScaledPixels(10.), ScaledPixels(8.)),
+        );
+        path.color = crate::red().into();
+        path.vertices.push(PathVertex {
+            xy_position: point(ScaledPixels(2.), ScaledPixels(3.)),
+            st_position: point(0.25, 0.75),
+            content_mask: path.content_mask.clone(),
+        });
+        let mut second = path.clone();
+        second.color = crate::blue().into();
+        second.vertices[0].xy_position = point(ScaledPixels(9.), ScaledPixels(11.));
+        let mut output = [const { mem::MaybeUninit::uninit() }; 2];
+        write_path_vertices(&[path, second], &mut output);
+        let [first, second] = output.map(|vertex| unsafe { vertex.assume_init() });
+        assert_eq!(first.xy_position, point(ScaledPixels(2.), ScaledPixels(3.)));
+        assert_eq!(
+            second.xy_position,
+            point(ScaledPixels(9.), ScaledPixels(11.))
+        );
+        assert_eq!(first.st_position, point(0.25, 0.75));
+        assert_eq!(
+            first.bounds,
+            Bounds::new(
+                point(ScaledPixels(5.), ScaledPixels(4.)),
+                size(ScaledPixels(10.), ScaledPixels(8.))
+            )
+        );
+        assert_eq!(first.color, crate::red().into());
+        assert_eq!(second.color, crate::blue().into());
+    }
+
+    #[test]
+    fn instance_sizing_rejects_arithmetic_overflow() {
+        let mut offset = 0;
+        assert_eq!(
+            reserve_instances::<PathRasterizationVertex>(&mut offset, usize::MAX),
+            None
+        );
+        offset = usize::MAX;
+        assert_eq!(reserve_instances::<Quad>(&mut offset, 1), None);
+    }
 }
