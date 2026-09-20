@@ -319,20 +319,20 @@ impl MetalRenderer {
                 setDrawableSize: size
             ];
         }
-        let device_pixels_size = Size {
-            width: DevicePixels(size.width as i32),
-            height: DevicePixels(size.height as i32),
-        };
-        self.update_path_intermediate_textures(device_pixels_size);
+        self.path_intermediate_texture = None;
+        self.path_intermediate_msaa_texture = None;
     }
 
-    fn update_path_intermediate_textures(&mut self, size: Size<DevicePixels>) {
-        // We are uncertain when this happens, but sometimes size can be 0 here. Most likely before
-        // the layout pass on window creation. Zero-sized texture creation causes SIGABRT.
-        // https://github.com/zed-industries/zed/issues/36229
-        if size.width.0 <= 0 || size.height.0 <= 0 {
+    fn update_path_intermediate_textures(&mut self, size: Size<DevicePixels>, has_paths: bool) {
+        if !has_paths || size.width.0 <= 0 || size.height.0 <= 0 {
             self.path_intermediate_texture = None;
             self.path_intermediate_msaa_texture = None;
+            return;
+        }
+
+        if self.path_intermediate_texture.as_ref().is_some_and(|texture| {
+            texture.width() == size.width.0 as u64 && texture.height() == size.height.0 as u64
+        }) {
             return;
         }
 
@@ -382,6 +382,7 @@ impl MetalRenderer {
             (viewport_size.width.ceil() as i32).into(),
             (viewport_size.height.ceil() as i32).into(),
         );
+        self.update_path_intermediate_textures(viewport_size, !scene.paths.is_empty());
         let drawable = if let Some(drawable) = layer.next_drawable() {
             drawable
         } else {
@@ -1425,6 +1426,41 @@ pub struct SurfaceBounds {
 mod tests {
     use super::*;
     use crate::{PathVertex, px};
+
+    #[test]
+    fn path_intermediates_follow_frame_demand_and_viewport_size() {
+        if metal::Device::system_default().is_none() {
+            return;
+        }
+        let mut renderer = MetalRenderer::new();
+        let viewport = size(DevicePixels(128), DevicePixels(96));
+        renderer.update_path_intermediate_textures(viewport, false);
+        assert!(renderer.path_intermediate_texture.is_none());
+        assert!(renderer.path_intermediate_msaa_texture.is_none());
+
+        renderer.update_path_intermediate_textures(viewport, true);
+        let original = renderer.path_intermediate_texture.as_ref().unwrap().clone();
+        renderer.update_path_intermediate_textures(viewport, true);
+        assert_eq!(
+            renderer.path_intermediate_texture.as_ref().unwrap().as_ptr(),
+            original.as_ptr()
+        );
+
+        renderer.update_path_intermediate_textures(viewport, false);
+        assert!(renderer.path_intermediate_texture.is_none());
+        assert!(renderer.path_intermediate_msaa_texture.is_none());
+        assert_eq!(original.width(), 128);
+        assert_eq!(original.height(), 96);
+
+        let resized = size(DevicePixels(64), DevicePixels(48));
+        renderer.update_path_intermediate_textures(resized, true);
+        let texture = renderer.path_intermediate_texture.as_ref().unwrap();
+        assert_eq!(texture.width(), 64);
+        assert_eq!(texture.height(), 48);
+        renderer.update_path_intermediate_textures(size(DevicePixels(0), DevicePixels(0)), true);
+        assert!(renderer.path_intermediate_texture.is_none());
+        assert!(renderer.path_intermediate_msaa_texture.is_none());
+    }
 
     #[test]
     fn lighter_frames_retire_large_buffers_after_gpu_completion() {
