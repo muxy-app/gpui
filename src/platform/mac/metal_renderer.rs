@@ -1205,7 +1205,7 @@ fn build_pipeline_state(
     color_attachment.set_source_rgb_blend_factor(metal::MTLBlendFactor::SourceAlpha);
     color_attachment.set_source_alpha_blend_factor(metal::MTLBlendFactor::One);
     color_attachment.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
-    color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::One);
+    color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
 
     device
         .new_render_pipeline_state(&descriptor)
@@ -1239,7 +1239,7 @@ fn build_path_sprite_pipeline_state(
     color_attachment.set_source_rgb_blend_factor(metal::MTLBlendFactor::One);
     color_attachment.set_source_alpha_blend_factor(metal::MTLBlendFactor::One);
     color_attachment.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
-    color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::One);
+    color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
 
     device
         .new_render_pipeline_state(&descriptor)
@@ -1425,7 +1425,7 @@ pub struct SurfaceBounds {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{PathVertex, px};
+    use crate::{Hsla, PathVertex, px};
 
     #[test]
     fn path_intermediates_follow_frame_demand_and_viewport_size() {
@@ -1539,6 +1539,79 @@ mod tests {
         );
         assert_eq!(first.color, crate::red().into());
         assert_eq!(second.color, crate::blue().into());
+    }
+
+    #[test]
+    fn translucent_layers_composite_with_over_alpha() {
+        if metal::Device::system_default().is_none() {
+            return;
+        }
+        let renderer = MetalRenderer::new();
+        let descriptor = metal::TextureDescriptor::new();
+        descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+        descriptor.set_width(1);
+        descriptor.set_height(1);
+        descriptor.set_storage_mode(metal::MTLStorageMode::Managed);
+        descriptor.set_usage(metal::MTLTextureUsage::RenderTarget);
+        let texture = renderer.device.new_texture(&descriptor);
+
+        let render_pass = metal::RenderPassDescriptor::new();
+        let color_attachment = render_pass.color_attachments().object_at(0).unwrap();
+        color_attachment.set_texture(Some(&texture));
+        color_attachment.set_load_action(metal::MTLLoadAction::Clear);
+        color_attachment.set_clear_color(metal::MTLClearColor::new(0., 0., 0., 0.5));
+        color_attachment.set_store_action(metal::MTLStoreAction::Store);
+
+        let viewport = size(DevicePixels(1), DevicePixels(1));
+        let bounds = Bounds::new(
+            point(ScaledPixels(-8.), ScaledPixels(-8.)),
+            size(ScaledPixels(16.), ScaledPixels(16.)),
+        );
+        let quad = Quad {
+            bounds,
+            content_mask: ContentMask { bounds },
+            background: Hsla::black().opacity(0.5).into(),
+            ..Default::default()
+        };
+        let mut instance_buffer = renderer
+            .instance_buffer_pool
+            .lock()
+            .acquire(&renderer.device, MIN_INSTANCE_BUFFER_SIZE);
+        let command_buffer = renderer.command_queue.new_command_buffer();
+        let encoder = command_buffer.new_render_command_encoder(render_pass);
+        encoder.set_viewport(metal::MTLViewport {
+            originX: 0.0,
+            originY: 0.0,
+            width: 1.0,
+            height: 1.0,
+            znear: 0.0,
+            zfar: 1.0,
+        });
+        let mut instance_offset = 0;
+        assert!(renderer.draw_quads(
+            &[quad],
+            &mut instance_buffer,
+            &mut instance_offset,
+            viewport,
+            encoder,
+        ));
+        encoder.end_encoding();
+        let blit = command_buffer.new_blit_command_encoder();
+        blit.synchronize_resource(&texture);
+        blit.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+
+        let mut pixel = [0u8; 4];
+        texture.get_bytes(
+            pixel.as_mut_ptr() as *mut c_void,
+            4,
+            metal::MTLRegion::new_2d(0, 0, 1, 1),
+            0,
+        );
+        // Half coverage over a half-transparent backdrop leaves a quarter of
+        // the content behind the window visible: alpha 0.75, not opaque.
+        assert!((190..=192).contains(&pixel[3]), "alpha {}", pixel[3]);
     }
 
     #[test]
