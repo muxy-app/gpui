@@ -335,7 +335,7 @@ impl TextLayout {
             .line_height
             .to_pixels(font_size.into(), window.rem_size());
 
-        let mut runs = if let Some(runs) = runs {
+        let runs = if let Some(runs) = runs {
             runs
         } else {
             vec![text_style.to_run(text.len())]
@@ -381,6 +381,8 @@ impl TextLayout {
                     return text_layout.size.unwrap();
                 }
 
+                // Truncation shortens the runs, so each measurement starts from the full runs.
+                let mut runs = runs.clone();
                 let mut line_wrapper = cx.text_system().line_wrapper(text_style.font(), font_size);
                 let text = if let Some(truncate_width) = truncate_width {
                     line_wrapper.truncate_line(
@@ -916,5 +918,49 @@ impl IntoElement for InteractiveText {
 
     fn into_element(self) -> Self::Element {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        AvailableSpace, DrawPhase, TestAppContext, TextOverflow, TextStyleRefinement, WhiteSpace,
+        px, size,
+    };
+
+    #[crate::test]
+    fn truncated_text_measured_at_a_wider_width_keeps_its_runs_whole(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        cx.update(|window, cx| {
+            window.invalidator.set_phase(DrawPhase::Prepaint);
+            let layout = TextLayout::default();
+            let style = TextStyleRefinement {
+                white_space: Some(WhiteSpace::Nowrap),
+                text_overflow: Some(TextOverflow::Truncate("…".into())),
+                ..Default::default()
+            };
+            let id = window.with_text_style(Some(style), |window| {
+                layout.layout("drop-voice-feature".into(), None, window, cx)
+            });
+
+            for width in [px(60.), px(100.)] {
+                window.compute_layout(
+                    id,
+                    size(AvailableSpace::Definite(width), AvailableSpace::MinContent),
+                    cx,
+                );
+            }
+
+            let inner = layout.0.borrow();
+            let line = &inner.as_ref().unwrap().lines[0];
+            assert!(
+                line.text.ends_with('…'),
+                "{:?} was not truncated",
+                line.text
+            );
+            let styled: u32 = line.decoration_runs.iter().map(|run| run.len).sum();
+            assert_eq!(styled as usize, line.text.len());
+        });
     }
 }
