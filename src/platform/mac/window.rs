@@ -44,7 +44,7 @@ use std::{
     ffi::{CStr, c_void},
     mem,
     ops::Range,
-    path::PathBuf,
+    path::{Path, PathBuf},
     ptr::{self, NonNull},
     rc::Rc,
     sync::{Arc, Weak},
@@ -85,6 +85,9 @@ type NSDragOperation = NSUInteger;
 const NSDragOperationNone: NSDragOperation = 0;
 #[allow(non_upper_case_globals)]
 const NSDragOperationCopy: NSDragOperation = 1;
+const FILE_URL_TYPE: &str = "public.file-url";
+const URL_TYPE: &str = "public.url";
+const TEXT_TYPE: &str = "public.utf8-plain-text";
 #[derive(PartialEq)]
 pub enum UserTabbingPreference {
     Never,
@@ -106,8 +109,9 @@ unsafe extern "C" {
 #[ctor]
 unsafe fn build_classes() {
     unsafe {
-        WINDOW_CLASS = build_window_class("GPUIWindow", class!(NSWindow));
-        PANEL_CLASS = build_window_class("GPUIPanel", class!(NSPanel));
+        WINDOW_CLASS = build_window_class("GPUIWindow", class!(NSWindow), yes);
+        // Panels float above the app's windows and never take main status from them.
+        PANEL_CLASS = build_window_class("GPUIPanel", class!(NSPanel), no);
         VIEW_CLASS = {
             let mut decl = ClassDecl::new("GPUIView", class!(NSView)).unwrap();
             decl.add_ivar::<*mut c_void>(WINDOW_STATE_IVAR);
@@ -291,16 +295,17 @@ pub(crate) fn convert_mouse_position(position: NSPoint, window_height: Pixels) -
     )
 }
 
-unsafe fn build_window_class(name: &'static str, superclass: &Class) -> *const Class {
+unsafe fn build_window_class(
+    name: &'static str,
+    superclass: &Class,
+    can_become_main: extern "C" fn(&Object, Sel) -> BOOL,
+) -> *const Class {
     unsafe {
         let mut decl = ClassDecl::new(name, superclass).unwrap();
         decl.add_ivar::<*mut c_void>(WINDOW_STATE_IVAR);
         decl.add_method(sel!(dealloc), dealloc_window as extern "C" fn(&Object, Sel));
 
-        decl.add_method(
-            sel!(canBecomeMainWindow),
-            yes as extern "C" fn(&Object, Sel) -> BOOL,
-        );
+        decl.add_method(sel!(canBecomeMainWindow), can_become_main);
         decl.add_method(
             sel!(canBecomeKeyWindow),
             yes as extern "C" fn(&Object, Sel) -> BOOL,
@@ -697,8 +702,15 @@ impl MacWindow {
             assert!(!native_window.is_null());
             let () = msg_send![
                 native_window,
-                registerForDraggedTypes:
-                    NSArray::arrayWithObject(nil, NSFilenamesPboardType)
+                registerForDraggedTypes: NSArray::arrayWithObjects(
+                    nil,
+                    &[
+                        NSFilenamesPboardType,
+                        ns_string(FILE_URL_TYPE),
+                        ns_string(URL_TYPE),
+                        ns_string(TEXT_TYPE),
+                    ]
+                )
             ];
             let () = msg_send![
                 native_window,
@@ -1784,6 +1796,10 @@ extern "C" fn yes(_: &Object, _: Sel) -> BOOL {
     YES
 }
 
+extern "C" fn no(_: &Object, _: Sel) -> BOOL {
+    NO
+}
+
 extern "C" fn dealloc_window(this: &Object, _: Sel) {
     unsafe {
         drop_window_state(this);
@@ -2557,19 +2573,25 @@ fn screen_point_to_gpui_point(this: &Object, position: NSPoint) -> Point<Pixels>
 extern "C" fn dragging_entered(this: &Object, _: Sel, dragging_info: id) -> NSDragOperation {
     let window_state = unsafe { get_window_state(this) };
     let position = drag_event_position(&window_state, dragging_info);
-    let paths = external_paths_from_event(dragging_info);
-    if let Some(event) =
-        paths.map(|paths| PlatformInput::FileDrop(FileDropEvent::Entered { position, paths }))
-        && send_new_event(&window_state, event)
-    {
-        window_state.lock().external_files_dragged = true;
-        return NSDragOperationCopy;
+    let accepted = external_paths_from_event(dragging_info).is_some_and(|paths| {
+        send_new_event(
+            &window_state,
+            PlatformInput::FileDrop(FileDropEvent::Entered { position, paths }),
+        )
+    });
+    window_state.lock().external_files_dragged = accepted;
+    if accepted {
+        NSDragOperationCopy
+    } else {
+        NSDragOperationNone
     }
-    NSDragOperationNone
 }
 
 extern "C" fn dragging_updated(this: &Object, _: Sel, dragging_info: id) -> NSDragOperation {
     let window_state = unsafe { get_window_state(this) };
+    if !window_state.lock().external_files_dragged {
+        return NSDragOperationNone;
+    }
     let position = drag_event_position(&window_state, dragging_info);
     if send_new_event(
         &window_state,
@@ -2600,21 +2622,93 @@ extern "C" fn perform_drag_operation(this: &Object, _: Sel, dragging_info: id) -
     .to_objc()
 }
 
+/// Reads dropped files from Finder-style file lists, file URLs, or text made only of
+/// absolute paths and file URLs, such as a file list dragged out of a web view.
 fn external_paths_from_event(dragging_info: *mut Object) -> Option<ExternalPaths> {
-    let mut paths = SmallVec::new();
     let pasteboard: id = unsafe { msg_send![dragging_info, draggingPasteboard] };
-    let filenames = unsafe { NSPasteboard::propertyListForType(pasteboard, NSFilenamesPboardType) };
-    if filenames == nil {
-        return None;
+    let paths = unsafe {
+        file_names(pasteboard)
+            .or_else(|| file_urls(pasteboard))
+            .or_else(|| {
+                let text = pasteboard_string(pasteboard, ns_string(TEXT_TYPE))?;
+                text_paths(&text, |path| path.exists())
+            })
+            .or_else(|| {
+                let url = pasteboard_string(pasteboard, ns_string(URL_TYPE))?;
+                Some(SmallVec::from_iter(file_url_path(&url)))
+            })
+    }?;
+    (!paths.is_empty()).then_some(ExternalPaths(paths))
+}
+
+unsafe fn file_names(pasteboard: id) -> Option<SmallVec<[PathBuf; 2]>> {
+    unsafe {
+        let names = NSPasteboard::propertyListForType(pasteboard, NSFilenamesPboardType);
+        if names == nil {
+            return None;
+        }
+        Some(
+            names
+                .iter()
+                .map(|name| PathBuf::from(name.to_str()))
+                .collect(),
+        )
     }
-    for file in unsafe { filenames.iter() } {
-        let path = unsafe {
-            let f = NSString::UTF8String(file);
-            CStr::from_ptr(f).to_string_lossy().into_owned()
-        };
-        paths.push(PathBuf::from(path))
+}
+
+unsafe fn file_urls(pasteboard: id) -> Option<SmallVec<[PathBuf; 2]>> {
+    unsafe {
+        let items: id = msg_send![pasteboard, pasteboardItems];
+        if items == nil {
+            return None;
+        }
+        let paths = items
+            .iter()
+            .filter_map(|item| {
+                let url: id = msg_send![item, stringForType: ns_string(FILE_URL_TYPE)];
+                (url != nil).then(|| file_url_path(url.to_str())).flatten()
+            })
+            .collect::<SmallVec<_>>();
+        (!paths.is_empty()).then_some(paths)
     }
-    Some(ExternalPaths(paths))
+}
+
+unsafe fn pasteboard_string(pasteboard: id, kind: id) -> Option<String> {
+    unsafe {
+        let text: id = msg_send![pasteboard, stringForType: kind];
+        (text != nil).then(|| text.to_str().to_owned())
+    }
+}
+
+/// Accepts the text only when every non-empty line is an existing absolute path or a file URL.
+fn text_paths(text: &str, exists: impl Fn(&Path) -> bool) -> Option<SmallVec<[PathBuf; 2]>> {
+    text.lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            if line.starts_with("file://") {
+                file_url_path(line)
+            } else {
+                let path = Path::new(line);
+                (path.is_absolute() && !line.contains('\0') && exists(path)).then(|| path.into())
+            }
+        })
+        .collect()
+}
+
+fn file_url_path(text: &str) -> Option<PathBuf> {
+    unsafe {
+        let url: id = msg_send![class!(NSURL), URLWithString: ns_string(text)];
+        if url == nil {
+            return None;
+        }
+        let is_file: BOOL = msg_send![url, isFileURL];
+        let path: id = msg_send![url, path];
+        if is_file == NO || path == nil {
+            return None;
+        }
+        let path = Path::new(path.to_str());
+        path.is_absolute().then(|| path.into())
+    }
 }
 
 extern "C" fn conclude_drag_operation(this: &Object, _: Sel, _: id) {
@@ -2834,6 +2928,33 @@ extern "C" fn toggle_tab_bar(this: &Object, _sel: Sel, _id: id) {
             drop(lock);
             callback();
             window_state.lock().toggle_tab_bar_callback = Some(callback);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::text_paths;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn text_drops_are_paths_only_when_every_line_is_one() {
+        let exists = |path: &Path| path == Path::new("/project/a b.txt");
+        assert_eq!(
+            text_paths("/project/a b.txt\r\nfile:///project/c%23d.txt\n", exists)
+                .map(|paths| paths.into_vec()),
+            Some(vec![
+                PathBuf::from("/project/a b.txt"),
+                PathBuf::from("/project/c#d.txt"),
+            ])
+        );
+        for text in [
+            "/project/a b.txt\nnot a path",
+            "/project/missing.txt",
+            "relative.txt",
+            "https://example.com/file.txt",
+        ] {
+            assert_eq!(text_paths(text, exists), None, "{text}");
         }
     }
 }
