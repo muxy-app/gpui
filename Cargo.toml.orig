@@ -83,6 +83,7 @@ path = "src/gpui.rs"
 doctest = false
 
 [dependencies]
+accesskit = "0.25.2"
 anyhow.workspace = true
 async-task = "4.7"
 backtrace = { version = "0.3", optional = true }
@@ -137,6 +138,7 @@ libc.workspace = true
 pin-project = "1.1.10"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+accesskit_macos = "0.27.2"
 block = "0.1"
 cocoa.workspace = true
 cocoa-foundation.workspace = true
@@ -163,6 +165,7 @@ pathfinder_geometry = "0.5"
 scap = { workspace = true, optional = true }
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+accesskit_unix = "0.24.1"
 # Always used
 flume = "0.11"
 oo7 = { version = "0.5.0", default-features = false, features = [
@@ -312,6 +315,10 @@ path = "examples/tree.rs"
 [[example]]
 name = "uniform_list"
 path = "examples/uniform_list.rs"
+
+[[example]]
+name = "a11y"
+path = "examples/a11y.rs"
 
 [[example]]
 name = "window_shadow"

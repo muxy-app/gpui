@@ -221,12 +221,19 @@ name = "window_positioning"
 path = "examples/window_positioning.rs"
 
 [[example]]
+name = "a11y"
+path = "examples/a11y.rs"
+
+[[example]]
 name = "window_shadow"
 path = "examples/window_shadow.rs"
 
 [[test]]
 name = "action_macros"
 path = "tests/action_macros.rs"
+
+[dependencies.accesskit]
+version = "0.25.2"
 
 [dependencies.anyhow]
 version = "1.0.86"
@@ -450,6 +457,9 @@ version = "0.2.2"
 features = ["test-support"]
 package = "gpui_util"
 
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies.accesskit_unix]
+version = "0.24.1"
+
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies.as-raw-xcb-connection]
 version = "1"
 optional = true
@@ -588,6 +598,9 @@ version = "0.0.8-zed"
 optional = true
 default-features = false
 package = "zed-scap"
+
+[target.'cfg(target_os = "macos")'.dependencies.accesskit_macos]
+version = "0.27.2"
 
 [target.'cfg(target_os = "macos")'.dependencies.block]
 version = "0.1"

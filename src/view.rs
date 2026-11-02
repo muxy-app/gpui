@@ -166,7 +166,7 @@ impl Element for AnyView {
     ) -> (LayoutId, Self::RequestLayoutState) {
         window.with_rendered_view(self.entity_id(), |window| {
             // Disable caching when inspecting so that mouse_hit_test has all hitboxes.
-            let caching_disabled = window.is_inspector_picking(cx);
+            let caching_disabled = window.view_caching_disabled(cx);
             match self.cached_style.as_ref() {
                 Some(style) if !caching_disabled => {
                     let mut root_style = Style::default();
@@ -263,7 +263,7 @@ impl Element for AnyView {
         cx: &mut App,
     ) {
         window.with_rendered_view(self.entity_id(), |window| {
-            let caching_disabled = window.is_inspector_picking(cx);
+            let caching_disabled = window.view_caching_disabled(cx);
             if self.cached_style.is_some() && !caching_disabled {
                 window.with_element_state::<AnyViewState, _>(
                     global_id.unwrap(),
@@ -369,5 +369,67 @@ pub struct EmptyView;
 impl Render for EmptyView {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         Empty
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Role, TestAppContext, div, prelude::*};
+
+    struct Cached;
+
+    impl Render for Cached {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().id("button").role(Role::Button)
+        }
+    }
+
+    struct Root(Entity<Cached>);
+
+    impl Render for Root {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .child(AnyView::from(self.0.clone()).cached(div().size_full().style().clone()))
+        }
+    }
+
+    #[crate::test]
+    fn cached_views_keep_their_accessibility_nodes_on_later_frames(cx: &mut TestAppContext) {
+        let root = cx.add_window(|_, cx| Root(cx.new(|_| Cached)));
+        let node_counts = cx
+            .update_window(root.into(), |root_view, window, cx| {
+                window.a11y.activate_for_test();
+                window.refresh();
+                window.draw(cx).clear();
+                cx.notify(root_view.entity_id());
+                window.draw(cx).clear();
+                let test_window = window.platform_window.as_test().unwrap();
+                test_window
+                    .0
+                    .lock()
+                    .a11y_tree_updates
+                    .iter()
+                    .map(|update| update.nodes.len())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap();
+
+        assert_eq!(node_counts, [2, 2]);
+    }
+
+    #[crate::test]
+    fn windows_without_an_accessibility_client_build_no_tree(cx: &mut TestAppContext) {
+        let root = cx.add_window(|_, cx| Root(cx.new(|_| Cached)));
+        cx.update_window(root.into(), |_, window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+
+            assert!(window.a11y.nodes.is_empty());
+            let test_window = window.platform_window.as_test().unwrap();
+            assert!(test_window.0.lock().a11y_tree_updates.is_empty());
+        })
+        .unwrap();
     }
 }

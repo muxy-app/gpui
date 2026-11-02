@@ -40,7 +40,7 @@ use parking_lot::Mutex;
 use raw_window_handle as rwh;
 use smallvec::SmallVec;
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     ffi::{CStr, c_void},
     mem,
     ops::Range,
@@ -53,6 +53,7 @@ use std::{
 use util::ResultExt;
 
 const WINDOW_STATE_IVAR: &str = "windowState";
+const ACCESSKIT_IVAR: &str = "accessKit";
 
 static mut WINDOW_CLASS: *const Class = ptr::null();
 static mut PANEL_CLASS: *const Class = ptr::null();
@@ -110,8 +111,21 @@ unsafe fn build_classes() {
         VIEW_CLASS = {
             let mut decl = ClassDecl::new("GPUIView", class!(NSView)).unwrap();
             decl.add_ivar::<*mut c_void>(WINDOW_STATE_IVAR);
+            decl.add_ivar::<*mut c_void>(ACCESSKIT_IVAR);
             unsafe {
                 decl.add_method(sel!(dealloc), dealloc_view as extern "C" fn(&Object, Sel));
+                decl.add_method(
+                    sel!(accessibilityChildren),
+                    accessibility_children as extern "C" fn(&Object, Sel) -> id,
+                );
+                decl.add_method(
+                    sel!(accessibilityFocusedUIElement),
+                    accessibility_focused_element as extern "C" fn(&Object, Sel) -> id,
+                );
+                decl.add_method(
+                    sel!(accessibilityHitTest:),
+                    accessibility_hit_test as extern "C" fn(&Object, Sel, NSPoint) -> id,
+                );
 
                 decl.add_method(
                     sel!(performKeyEquivalent:),
@@ -932,6 +946,7 @@ impl MacWindow {
 impl Drop for MacWindow {
     fn drop(&mut self) {
         let mut this = self.0.lock();
+        unsafe { drop_accesskit_state(this.native_view.as_ref()) };
         this.renderer.destroy();
         let window = this.native_window;
         this.display_link.take();
@@ -1543,6 +1558,149 @@ impl PlatformWindow for MacWindow {
             })
             .detach();
     }
+
+    fn a11y_init(&self, callbacks: crate::A11yCallbacks) {
+        let view = self.0.lock().native_view;
+        let adapter = unsafe {
+            accesskit_macos::Adapter::new(
+                view.as_ptr().cast(),
+                false,
+                A11yActionHandler(callbacks.action),
+            )
+        };
+        let state = Box::new(RefCell::new(AccessKitState {
+            adapter,
+            activation_handler: A11yActivationHandler {
+                callback: callbacks.activation,
+            },
+        }));
+        unsafe {
+            (*view.as_ptr()).set_ivar(ACCESSKIT_IVAR, Box::into_raw(state).cast::<c_void>());
+        }
+    }
+
+    fn a11y_tree_update(&self, tree_update: accesskit::TreeUpdate) {
+        let view = self.0.lock().native_view;
+        let events = unsafe { accesskit_state(view.as_ref()) }
+            .and_then(|state| state.borrow_mut().adapter.update_if_active(|| tree_update));
+        if let Some(events) = events {
+            events.raise();
+        }
+    }
+
+    fn a11y_update_window_bounds(&self) {
+        // macOS handles window bounds tracking automatically via NSAccessibility.
+    }
+}
+
+/// The AccessKit adapter of one `GPUIView`. It's kept in the view's own ivar, not
+/// in `MacWindowState`, because AppKit can ask for the tree whenever it likes, and
+/// answering must never wait for the window state's lock.
+struct AccessKitState {
+    adapter: accesskit_macos::Adapter,
+    activation_handler: A11yActivationHandler,
+}
+
+unsafe fn accesskit_state(view: &Object) -> Option<&RefCell<AccessKitState>> {
+    unsafe {
+        let raw: *mut c_void = *view.get_ivar(ACCESSKIT_IVAR);
+        raw.cast::<RefCell<AccessKitState>>().as_ref()
+    }
+}
+
+unsafe fn drop_accesskit_state(view: &Object) {
+    unsafe {
+        let raw: *mut c_void = *view.get_ivar(ACCESSKIT_IVAR);
+        if !raw.is_null() {
+            let view = view as *const Object as *mut Object;
+            (*view).set_ivar(ACCESSKIT_IVAR, ptr::null_mut::<c_void>());
+            drop(Box::from_raw(raw.cast::<RefCell<AccessKitState>>()));
+        }
+    }
+}
+
+/// The GPUI tree followed by the view's real subviews. Native children, such as web
+/// pages, must stay reachable alongside what GPUI draws.
+extern "C" fn accessibility_children(this: &Object, _: Sel) -> id {
+    unsafe {
+        let subviews: id = msg_send![super(this, class!(NSView)), accessibilityChildren];
+        let Some(mut state) = accesskit_state(this).and_then(|state| state.try_borrow_mut().ok())
+        else {
+            return subviews;
+        };
+        let AccessKitState {
+            adapter,
+            activation_handler,
+        } = &mut *state;
+        let tree = adapter.view_children(activation_handler) as id;
+        if subviews == nil {
+            tree
+        } else {
+            msg_send![tree, arrayByAddingObjectsFromArray: subviews]
+        }
+    }
+}
+
+extern "C" fn accessibility_focused_element(this: &Object, _: Sel) -> id {
+    unsafe {
+        if let Some(mut state) = accesskit_state(this).and_then(|state| state.try_borrow_mut().ok())
+        {
+            let AccessKitState {
+                adapter,
+                activation_handler,
+            } = &mut *state;
+            let focused = adapter.focus(activation_handler) as id;
+            if focused != nil {
+                return focused;
+            }
+        }
+        msg_send![super(this, class!(NSView)), accessibilityFocusedUIElement]
+    }
+}
+
+extern "C" fn accessibility_hit_test(this: &Object, _: Sel, point: NSPoint) -> id {
+    unsafe {
+        let window: id = msg_send![this, window];
+        let superview: id = msg_send![this, superview];
+        if window != nil && superview != nil {
+            let in_window: NSPoint = msg_send![window, convertPointFromScreen: point];
+            let in_superview: NSPoint = msg_send![superview, convertPoint: in_window fromView: nil];
+            let hit: id = msg_send![this, hitTest: in_superview];
+            if hit != nil && !ptr::eq(hit as *const Object, this) {
+                return msg_send![hit, accessibilityHitTest: point];
+            }
+        }
+        if let Some(mut state) = accesskit_state(this).and_then(|state| state.try_borrow_mut().ok())
+        {
+            let AccessKitState {
+                adapter,
+                activation_handler,
+            } = &mut *state;
+            return adapter.hit_test(
+                accesskit_macos::NSPoint::new(point.x, point.y),
+                activation_handler,
+            ) as id;
+        }
+        msg_send![super(this, class!(NSView)), accessibilityHitTest: point]
+    }
+}
+
+struct A11yActivationHandler {
+    callback: Box<dyn Fn() -> Option<accesskit::TreeUpdate> + Send + 'static>,
+}
+
+impl accesskit::ActivationHandler for A11yActivationHandler {
+    fn request_initial_tree(&mut self) -> Option<accesskit::TreeUpdate> {
+        (self.callback)()
+    }
+}
+
+struct A11yActionHandler(Box<dyn Fn(accesskit::ActionRequest) + Send + 'static>);
+
+impl accesskit::ActionHandler for A11yActionHandler {
+    fn do_action(&mut self, request: accesskit::ActionRequest) {
+        (self.0)(request);
+    }
 }
 
 impl rwh::HasWindowHandle for MacWindow {
@@ -1615,6 +1773,7 @@ extern "C" fn dealloc_window(this: &Object, _: Sel) {
 
 extern "C" fn dealloc_view(this: &Object, _: Sel) {
     unsafe {
+        drop_accesskit_state(this);
         drop_window_state(this);
         let _: () = msg_send![super(this, class!(NSView)), dealloc];
     }
@@ -1997,7 +2156,18 @@ extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) 
     }
 
     let executor = lock.executor.clone();
+    let native_view = lock.native_view;
     drop(lock);
+
+    let a11y_events = unsafe { accesskit_state(native_view.as_ref()) }.and_then(|state| {
+        state
+            .borrow_mut()
+            .adapter
+            .update_view_focus_state(is_active)
+    });
+    if let Some(events) = a11y_events {
+        events.raise();
+    }
 
     // When a window becomes active, trigger an immediate synchronous frame request to prevent
     // tab flicker when switching between windows in native tabs mode.

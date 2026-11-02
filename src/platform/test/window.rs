@@ -29,6 +29,8 @@ pub(crate) struct TestWindowState {
     moved_callback: Option<Box<dyn FnMut()>>,
     input_handler: Option<PlatformInputHandler>,
     is_fullscreen: bool,
+    #[cfg(test)]
+    pub(crate) a11y_tree_updates: Vec<accesskit::TreeUpdate>,
 }
 
 #[derive(Clone)]
@@ -74,6 +76,8 @@ impl TestWindow {
             moved_callback: None,
             input_handler: None,
             is_fullscreen: false,
+            #[cfg(test)]
+            a11y_tree_updates: Vec::new(),
         })))
     }
 
@@ -290,6 +294,11 @@ impl PlatformWindow for TestWindow {
     }
 
     fn update_ime_position(&self, _bounds: Bounds<Pixels>) {}
+
+    #[cfg(test)]
+    fn a11y_tree_update(&self, tree_update: accesskit::TreeUpdate) {
+        self.0.lock().a11y_tree_updates.push(tree_update);
+    }
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {
         None
