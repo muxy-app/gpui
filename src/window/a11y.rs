@@ -180,6 +180,16 @@ impl A11y {
     }
 }
 
+/// Where the tree stood before a prepaint that may be rolled back.
+#[derive(Clone, Copy)]
+pub(crate) struct A11yCheckpoint {
+    nodes: usize,
+    children: usize,
+    focus: NodeId,
+    #[cfg(debug_assertions)]
+    has_set_focus: bool,
+}
+
 pub(crate) struct A11yNodeBuilder {
     ids_stack: SmallVec<[NodeId; 16]>,
     nodes_stack: SmallVec<[accesskit::Node; 16]>,
@@ -237,6 +247,35 @@ impl A11yNodeBuilder {
 
         if let (Some(id), Some(node)) = (self.ids_stack.pop(), self.nodes_stack.pop()) {
             self.all_nodes.push((id, node));
+        }
+    }
+
+    /// Remembers the tree before a prepaint that may be rolled back.
+    pub(crate) fn checkpoint(&self) -> A11yCheckpoint {
+        A11yCheckpoint {
+            nodes: self.all_nodes.len(),
+            children: self.nodes_stack.last().map_or(0, |node| node.children().len()),
+            focus: self.focus,
+            #[cfg(debug_assertions)]
+            has_set_focus: self.has_set_focus,
+        }
+    }
+
+    /// Forgets what was pushed since `checkpoint`, so the same elements can be
+    /// prepainted again in this frame. Pushes and pops are balanced by then, so
+    /// the top of the stack is the node that was on top at the checkpoint.
+    pub(crate) fn rollback(&mut self, checkpoint: A11yCheckpoint) {
+        for (id, _) in self.all_nodes.drain(checkpoint.nodes..) {
+            self.seen_ids.remove(&id);
+        }
+        if let Some(parent) = self.nodes_stack.last_mut() {
+            let children = parent.children()[..checkpoint.children].to_vec();
+            parent.set_children(children);
+        }
+        self.focus = checkpoint.focus;
+        #[cfg(debug_assertions)]
+        {
+            self.has_set_focus = checkpoint.has_set_focus;
         }
     }
 
@@ -385,6 +424,39 @@ mod tests {
         assert_eq!(find(ROOT_NODE_ID).label(), Some("Window title"));
         assert_eq!(find(ROOT_NODE_ID).children(), &[NodeId(1)]);
         assert_eq!(find(NodeId(1)).children(), &[NodeId(2)]);
+    }
+
+    #[test]
+    fn a_rolled_back_prepaint_can_push_the_same_nodes_again() {
+        let mut builder = A11yNodeBuilder::new();
+        builder.begin_frame(None);
+        assert!(builder.push(NodeId(1), node()));
+        builder.pop();
+
+        let checkpoint = builder.checkpoint();
+        assert!(builder.push(NodeId(2), node()));
+        assert!(builder.push(NodeId(3), node()));
+        builder.set_focus(NodeId(3));
+        builder.pop();
+        builder.pop();
+        builder.rollback(checkpoint);
+
+        assert!(!builder.has_node(NodeId(2)));
+        assert!(builder.has_node(NodeId(1)));
+        assert!(builder.push(NodeId(2), node()));
+        builder.set_focus(NodeId(2));
+        builder.pop();
+
+        let update = builder.finalize();
+        let root = update
+            .nodes
+            .iter()
+            .find(|(id, _)| *id == ROOT_NODE_ID)
+            .map(|(_, node)| node)
+            .unwrap();
+        assert_eq!(root.children(), &[NodeId(1), NodeId(2)]);
+        assert_eq!(update.focus, NodeId(2));
+        assert_eq!(update.nodes.len(), 3);
     }
 
     #[test]
