@@ -463,11 +463,25 @@ impl MacWindowState {
                 let mut close_button_frame: CGRect = msg_send![close_button, frame];
                 let mut min_button_frame: CGRect = msg_send![min_button, frame];
                 let mut zoom_button_frame: CGRect = msg_send![zoom_button, frame];
+                let button_height = px(close_button_frame.size.height as f32);
+                // A button past the bottom of its container is drawn but cannot be clicked.
+                let titlebar_height = titlebar_height
+                    .max(px(
+                        f32::from(traffic_light_position.y + button_height).ceil()
+                    ));
+                let titlebar: id = msg_send![close_button, superview];
+                let container: id = msg_send![titlebar, superview];
+                let mut container_frame: CGRect = msg_send![container, frame];
+                if container_frame.size.height as f32 != f32::from(titlebar_height) {
+                    let window_frame = NSWindow::frame(self.native_window);
+                    container_frame.size.height = f32::from(titlebar_height).into();
+                    container_frame.origin.y =
+                        window_frame.size.height - container_frame.size.height;
+                    let _: () = msg_send![container, setFrame: container_frame];
+                }
                 let mut origin = point(
                     traffic_light_position.x,
-                    titlebar_height
-                        - traffic_light_position.y
-                        - px(close_button_frame.size.height as f32),
+                    titlebar_height - traffic_light_position.y - button_height,
                 );
                 let button_spacing =
                     px((min_button_frame.origin.x - close_button_frame.origin.x) as f32);
@@ -1268,6 +1282,12 @@ impl PlatformWindow for MacWindow {
     }
 
     fn set_app_id(&mut self, _app_id: &str) {}
+
+    fn set_traffic_light_position(&self, position: Point<Pixels>) {
+        let mut lock = self.0.lock();
+        lock.traffic_light_position = Some(position);
+        lock.move_traffic_light();
+    }
 
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance) {
         let mut this = self.0.as_ref().lock();

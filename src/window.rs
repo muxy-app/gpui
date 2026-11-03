@@ -1891,6 +1891,11 @@ impl Window {
         self.platform_window.zoom();
     }
 
+    /// Moves the macOS traffic lights, measured from the top left of the window.
+    pub fn set_traffic_light_position(&self, position: Point<Pixels>) {
+        self.platform_window.set_traffic_light_position(position)
+    }
+
     /// Opens the native title bar context menu, useful when implementing client side decorations (Wayland and X11)
     pub fn show_window_menu(&self, position: Point<Pixels>) {
         self.platform_window.show_window_menu(position)
