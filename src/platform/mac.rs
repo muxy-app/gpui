@@ -45,6 +45,8 @@ use std::{
     ops::Range,
 };
 
+pub use events::keystroke_from_native_event;
+
 pub(crate) use dispatcher::*;
 pub(crate) use display::*;
 pub(crate) use display_link::*;

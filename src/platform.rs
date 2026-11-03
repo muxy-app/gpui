@@ -75,6 +75,8 @@ pub use keystroke::*;
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub(crate) use linux::*;
 #[cfg(target_os = "macos")]
+pub use mac::keystroke_from_native_event;
+#[cfg(target_os = "macos")]
 pub(crate) use mac::*;
 pub use semantic_version::SemanticVersion;
 #[cfg(any(test, feature = "test-support"))]

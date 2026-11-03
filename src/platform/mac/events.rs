@@ -10,7 +10,7 @@ use crate::{
 };
 use cocoa::{
     appkit::{NSEvent, NSEventModifierFlags, NSEventPhase, NSEventType},
-    base::{YES, id},
+    base::{YES, id, nil},
 };
 use core_foundation::data::{CFDataGetBytePtr, CFDataRef};
 use core_graphics::event::CGKeyCode;
@@ -294,6 +294,22 @@ impl PlatformInput {
     }
 }
 
+/// Reads the keystroke GPUI sees for a native `NSEvent`, resolved against the current keyboard
+/// layout. Returns `None` unless the event is a key down or key up.
+pub fn keystroke_from_native_event(native_event: *mut c_void) -> Option<Keystroke> {
+    let native_event = native_event as id;
+    if native_event == nil {
+        return None;
+    }
+    unsafe {
+        matches!(
+            native_event.eventType(),
+            NSEventType::NSKeyDown | NSEventType::NSKeyUp
+        )
+        .then(|| parse_keystroke(native_event))
+    }
+}
+
 unsafe fn parse_keystroke(native_event: id) -> Keystroke {
     unsafe {
         use cocoa::appkit::*;
@@ -530,4 +546,62 @@ fn chars_for_modified_key(code: CGKeyCode, modifiers: u32) -> String {
         let _: () = msg_send![keyboard, release];
     }
     String::from_utf16(&buffer[..buffer_size]).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cocoa::{
+        base::NO,
+        foundation::{NSPoint, NSString},
+    };
+
+    fn key_event(kind: NSEventType, code: u16, characters: &str) -> id {
+        unsafe {
+            let characters = NSString::alloc(nil).init_str(characters);
+            NSEvent::keyEventWithType_location_modifierFlags_timestamp_windowNumber_context_characters_charactersIgnoringModifiers_isARepeat_keyCode_(
+                nil,
+                kind,
+                NSPoint::new(0.0, 0.0),
+                NSEventModifierFlags::NSCommandKeyMask,
+                0.0,
+                0,
+                nil,
+                characters,
+                characters,
+                NO,
+                code,
+            )
+        }
+    }
+
+    #[test]
+    fn native_key_events_become_keystrokes() {
+        for kind in [NSEventType::NSKeyDown, NSEventType::NSKeyUp] {
+            let keystroke = keystroke_from_native_event(key_event(kind, 36, "\r").cast())
+                .expect("key events have a keystroke");
+            assert_eq!(keystroke.key, "enter");
+            assert!(keystroke.modifiers.platform);
+        }
+    }
+
+    #[test]
+    fn other_native_events_have_no_keystroke() {
+        let mouse = unsafe {
+            NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure_(
+                nil,
+                NSEventType::NSLeftMouseDown,
+                NSPoint::new(0.0, 0.0),
+                NSEventModifierFlags::empty(),
+                0.0,
+                0,
+                nil,
+                0,
+                1,
+                1.0,
+            )
+        };
+        assert_eq!(keystroke_from_native_event(mouse.cast()), None);
+        assert_eq!(keystroke_from_native_event(std::ptr::null_mut()), None);
+    }
 }
